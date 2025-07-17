@@ -1,0 +1,47 @@
+import board
+import busio
+import adafruit_vl53l0x
+import time
+from collections import deque
+
+OFFSET_MM = 0
+
+BUFFER_SIZE = 5          # ขนาด buffer ค่าเฉลี่ย
+CHANGE_THRESHOLD = 5     # ถ้าต่างเกิน 5 mm จึงอัปเดต
+ZERO_THRESHOLD = 70      # ถ้าต่ำกว่า 70 mm ให้แสดง 0
+
+i2c = busio.I2C(board.SCL, board.SDA)
+vl53 = adafruit_vl53l0x.VL53L0X(i2c)
+
+# Timing budget พอประมาณ
+vl53.measurement_timing_budget = 33000
+vl53.signal_rate_limit = 0.05
+
+print("Start ranging... Press Ctrl+C to stop.")
+
+buffer = deque(maxlen=BUFFER_SIZE)
+last_stable = None
+
+while True:
+    current_range = vl53.range + OFFSET_MM
+    buffer.append(current_range)
+
+    avg_range = sum(buffer) / len(buffer)
+
+    if last_stable is None:
+        stable_range = avg_range
+    else:
+        if abs(avg_range - last_stable) >= CHANGE_THRESHOLD:
+            stable_range = avg_range
+        else:
+            stable_range = last_stable
+
+    # ถ้าค่าน้อยกว่า ZERO_THRESHOLD ให้โชว์ 0
+    if stable_range < ZERO_THRESHOLD:
+        display_range = 0
+    else:
+        display_range = stable_range
+
+    print("Range: {:.1f} mm".format(display_range))
+    last_stable = stable_range
+    time.sleep(0.05)
