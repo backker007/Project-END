@@ -28,8 +28,7 @@ buffers = []
 last_values = []
 mcp = None
 relay_pins = []
-pins_a = []  # A0-A7
-pins_b = []  # B0-B3 (MCP23017 มี B0-B7 ได้ถึง 15)
+mcp_pins = []  # 0-15 เรียงตามลำดับ A0–A7, B0–B7
 selected_sensor_index = None
 reading_active = False
 
@@ -66,68 +65,16 @@ def main():
                     if key == str(selected_sensor_index + 1):
                         relay_pins[selected_sensor_index].value = False
                         reading_active = False
-                        print(f"S{selected_sensor_index + 1}: Reading stopped")
+
+                        if not is_door_closed(selected_sensor_index):
+                            print(f"❌ ช่อง {selected_sensor_index + 1}: Magnetic lock ปิดไม่สนิท!")
+                        else:
+                            print(f"✅ ช่อง {selected_sensor_index + 1}: Magnetic lock ปิดเรียบร้อย")
                         break
         finally:
             termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
 
 # ==== INIT ====
-def init_mcp():
-    global mcp, relay_pins, pins_a, pins_b
-    i2c_mcp = busio.I2C(1, 0)
-    mcp = MCP23017(i2c_mcp)
-    relay_pin_nums = [12, 13, 14, 15]
-    pins_a_nums = list(range(0, 8))   # A0-A7 = pin 0–7
-    pins_b_nums = list(range(8, 12))  # B0-B3 = pin 8–11
-
-    relay_pins = []
-    pins_a = []
-    pins_b = []
-
-    for pin_num in relay_pin_nums:
-        pin = mcp.get_pin(pin_num)
-        pin.direction = Direction.OUTPUT
-        pin.value = False
-        relay_pins.append(pin)
-
-    for pin_num in pins_a_nums:
-        pin = mcp.get_pin(pin_num)
-        pin.direction = Direction.OUTPUT
-        pin.value = False
-        pins_a.append(pin)
-
-    for pin_num in pins_b_nums:
-        pin = mcp.get_pin(pin_num)
-        pin.direction = Direction.OUTPUT
-        pin.value = False
-        pins_b.append(pin)
-
-def init_xshuts():
-    global xshuts
-    xshuts = []
-    for pin in XSHUT_PINS:
-        x = digitalio.DigitalInOut(pin)
-        x.direction = digitalio.Direction.OUTPUT
-        x.value = False
-        xshuts.append(x)
-    time.sleep(0.2)
-
-def reset_vl53_addresses():
-    i2c = busio.I2C(board.SCL, board.SDA)
-    for i, x in enumerate(xshuts):
-        x.value = True
-        time.sleep(0.1)
-        try:
-            sensor = adafruit_vl53l0x.VL53L0X(i2c, address=ADDRESS_BASE + i)
-            sensor.set_address(0x29)
-        except:
-            pass
-        x.value = False
-    time.sleep(0.2)
-
-def reset_i2c_bus():
-    os.system("sudo i2cdetect -y 1 > /dev/null 2>&1")
-    time.sleep(0.5)
 
 def init_sensors():
     global vl53_sensors, buffers, last_values
@@ -148,10 +95,59 @@ def init_sensors():
         except:
             x.value = False
     if not vl53_sensors:
-        print("\u26a0\ufe0f No sensors found. Trying I2C reset...")
+        print("⚠️ No sensors found. Trying I2C reset...")
         reset_i2c_bus()
-        print("\U0001F501 Retrying sensor init...")
+        print("🔁 Retrying sensor init...")
         init_sensors()
+
+def reset_i2c_bus():
+    os.system("sudo i2cdetect -y 1 > /dev/null 2>&1")
+    time.sleep(0.5)
+
+def reset_vl53_addresses():
+    i2c = busio.I2C(board.SCL, board.SDA)
+    for i, x in enumerate(xshuts):
+        x.value = True
+        time.sleep(0.1)
+        try:
+            sensor = adafruit_vl53l0x.VL53L0X(i2c, address=ADDRESS_BASE + i)
+            sensor.set_address(0x29)
+        except:
+            pass
+        x.value = False
+    time.sleep(0.2)
+
+def init_xshuts():
+    global xshuts
+    xshuts = []
+    for pin in XSHUT_PINS:
+        x = digitalio.DigitalInOut(pin)
+        x.direction = digitalio.Direction.OUTPUT
+        x.value = False
+        xshuts.append(x)
+    time.sleep(0.2)
+
+def init_mcp():
+    global mcp, relay_pins, mcp_pins
+    i2c_mcp = busio.I2C(1, 0)
+    mcp = MCP23017(i2c_mcp)
+
+    relay_pin_nums = [12, 13, 14, 15]  # B4-B7
+    relay_pins = []
+    mcp_pins = []
+
+    for pin_num in range(16):
+        pin = mcp.get_pin(pin_num)
+        if pin_num in relay_pin_nums:
+            pin.direction = Direction.OUTPUT
+            pin.value = False
+            relay_pins.append(pin)
+        elif pin_num <= 7:
+            pin.direction = Direction.OUTPUT  # A0–A7
+        else:
+            pin.direction = Direction.INPUT   # B0–B3
+            pin.pull_up = True
+        mcp_pins.append(pin)
 
 # ==== SENSOR ====
 def read_sensor(sensor_index):
@@ -167,28 +163,48 @@ def read_sensor(sensor_index):
     except:
         return -1
 
+# ==== SENSOR SWITCH CHECK ====
+def is_door_closed(channel: int) -> bool:
+    try:
+        pin_number = 8 + channel  # ช่อง 0 → B0 (8), ช่อง 1 → B1 (9), ...
+        pin = mcp_pins[pin_number]
+
+        # Software debounce: อ่านหลายครั้งใน 0.5 วินาที
+        low_count = 0
+        for _ in range(10):
+            if pin.value == 0:
+                low_count += 1
+            time.sleep(0.05)
+
+        return low_count >= 7
+    except:
+        return False
+
 # ==== LED STATUS CHECK ====
 def check_slots_and_update_leds():
-    print("\U0001F527 Checking slots and updating LEDs...")
+    print("🔧 Checking slots and updating LEDs...")
     for i in range(len(vl53_sensors)):
         result = read_sensor(i)
+        green_led = mcp_pins[i]      # A0–A3
+        red_led = mcp_pins[8 + i]    # B0–B3
+
         if result == -1:
             print(f"S{i+1}: Sensor error")
-            pins_a[i].value = False  # green off
-            pins_b[i].value = True   # red on
+            green_led.value = False
+            red_led.value = True
         elif result == 0:
             print(f"S{i+1}: Slot is EMPTY")
-            pins_a[i].value = True   # green on
-            pins_b[i].value = False  # red off
+            green_led.value = True
+            red_led.value = False
         else:
             print(f"S{i+1}: Slot is FULL ({result:.1f} mm)")
-            pins_a[i].value = False  # green off
-            pins_b[i].value = True   # red on
+            green_led.value = False
+            red_led.value = True
 
 # ==== USER INPUT ====
 def wait_for_user_input():
     global selected_sensor_index, reading_active
-    print("\U0001F4E1 Ready. เลือก Relay (1–4) เพื่อเริ่มอ่าน หรือ 0 เพื่อปิดทั้งหมด:")
+    print("📡 Ready. เลือก Relay (1–4) เพื่อเริ่มอ่าน หรือ 0 เพื่อปิดทั้งหมด:")
     val = input().strip()
     if val in ["0", "1", "2", "3", "4"]:
         n = int(val)
