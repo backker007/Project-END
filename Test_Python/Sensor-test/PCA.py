@@ -9,9 +9,9 @@ import select
 import tty
 import termios
 from collections import deque
+from smbus2 import SMBus
 from adafruit_mcp230xx.mcp23017 import MCP23017
 from digitalio import Direction
-from adafruit_pca9685 import PCA9685
 
 # ==== CONFIG ====
 XSHUT_PINS = [board.D17, board.D27, board.D22, board.D5]
@@ -21,9 +21,8 @@ BUFFER_SIZE = 5
 CHANGE_THRESHOLD = 5
 ZERO_THRESHOLD = 70
 CHECK_INTERVAL = 120  # 2 minutes
-SERVO_CHANNELS = [0, 1, 2, 3]  # ช่อง 1-4 ใช้ช่อง 0-3 บน PCA9685
-SERVO_OPEN = 600  # pulse ที่ใช้เปิด
-SERVO_CLOSE = 150  # pulse ที่ใช้ปิด
+SERVO_CHANNELS = [0, 1, 2, 3]
+PCA9685_ADDRESS = 0x40
 
 # ==== GLOBAL ====
 vl53_sensors = []
@@ -32,14 +31,78 @@ buffers = []
 last_values = []
 mcp = None
 relay_pins = []
-mcp_pins = []  # 0-15 เรียงตามลำดับ A0–A7, B0–B7
+mcp_pins = []
 selected_sensor_index = None
 reading_active = False
 
-# ใช้ I2C สำหรับทั้ง MCP23017 และ PCA9685 บนบัสเดียวกัน
-shared_i2c = busio.I2C(board.SCL, board.SDA)
-pca = PCA9685(shared_i2c)
-pca.frequency = 50
+# ==== INIT I2C ====
+i2c_vl53 = busio.I2C(board.SCL, board.SDA)  # VL53L0X on bus 1
+
+try:
+    i2c_bus0 = SMBus(0)  # MCP23017 & PCA9685 on bus 0
+except Exception as e:
+    print(f"❌ I2C init error (bus 0): {e}")
+    sys.exit(1)
+
+# ==== PCA9685 ADAPTER ====
+class PCA9685:
+    def __init__(self, bus: SMBus, address: int = 0x40):
+        self.bus = bus
+        self.address = address
+        self.set_all_pwm(0, 0)
+        self.write8(0x00, 0x20)  # MODE1 restart
+        time.sleep(0.005)
+        self.write8(0x01, 0x04)  # MODE2 OUTDRV
+
+    def set_pwm_freq(self, freq_hz: float):
+        prescaleval = 25000000.0
+        prescaleval /= 4096.0
+        prescaleval /= float(freq_hz)
+        prescaleval -= 1.0
+        prescale = int(prescaleval + 0.5)
+
+        oldmode = self.read8(0x00)
+        newmode = (oldmode & 0x7F) | 0x10
+        self.write8(0x00, newmode)
+        self.write8(0xFE, prescale)
+        self.write8(0x00, oldmode)
+        time.sleep(0.005)
+        self.write8(0x00, oldmode | 0x80)
+
+    def set_pwm(self, channel: int, on: int, off: int):
+        self.write8(0x06 + 4 * channel, on & 0xFF)
+        self.write8(0x07 + 4 * channel, on >> 8)
+        self.write8(0x08 + 4 * channel, off & 0xFF)
+        self.write8(0x09 + 4 * channel, off >> 8)
+
+    def set_all_pwm(self, on: int, off: int):
+        self.write8(0xFA, on & 0xFF)
+        self.write8(0xFB, on >> 8)
+        self.write8(0xFC, off & 0xFF)
+        self.write8(0xFD, off >> 8)
+
+    def write8(self, reg: int, value: int):
+        self.bus.write_byte_data(self.address, reg, value)
+
+    def read8(self, reg: int) -> int:
+        return self.bus.read_byte_data(self.address, reg)
+
+# ==== INIT PCA9685 ====
+try:
+    pca = PCA9685(i2c_bus0, address=PCA9685_ADDRESS)
+    pca.set_pwm_freq(50)
+except Exception as e:
+    print(f"❌ PCA9685 init error: {e}")
+    print("💡 ตรวจสอบการเชื่อมต่อและ address (ใช้ i2cdetect -y 0)")
+    sys.exit(1)
+
+# ==== SERVO CONTROL ====
+def set_servo_angle(channel: int, angle: float):
+    pulse_length = 1000000    # 1,000,000 us per second
+    pulse_length //= 50       # 50 Hz
+    pulse_length //= 4096     # 12 bits of resolution
+    pulse = int((angle * 2.0 / 180.0 + 0.5) * 1000 / pulse_length)
+    pca.set_pwm(channel, 0, pulse)
 
 # ==== MAIN ====
 def main():
@@ -48,7 +111,6 @@ def main():
     init_xshuts()
     reset_vl53_addresses()
     init_sensors()
-
     last_check = time.time()
 
     while True:
@@ -73,7 +135,7 @@ def main():
                     key = sys.stdin.read(1)
                     if key == str(selected_sensor_index + 1):
                         relay_pins[selected_sensor_index].value = False
-                        set_servo_angle(selected_sensor_index, SERVO_CLOSE)
+                        set_servo_angle(selected_sensor_index, 0)
                         reading_active = False
 
                         if not is_door_closed(selected_sensor_index):
@@ -85,18 +147,16 @@ def main():
             termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
 
 # ==== INIT ====
-
 def init_sensors():
     global vl53_sensors, buffers, last_values
     vl53_sensors.clear()
     buffers.clear()
     last_values.clear()
-    i2c = shared_i2c
     for i, x in enumerate(xshuts):
         x.value = True
         time.sleep(0.2)
         try:
-            sensor = adafruit_vl53l0x.VL53L0X(i2c)
+            sensor = adafruit_vl53l0x.VL53L0X(i2c_vl53)
             sensor.set_address(ADDRESS_BASE + i)
             sensor.measurement_timing_budget = 33000
             vl53_sensors.append(sensor)
@@ -111,16 +171,15 @@ def init_sensors():
         init_sensors()
 
 def reset_i2c_bus():
-    os.system("sudo i2cdetect -y 1 > /dev/null 2>&1")
+    os.system("sudo i2cdetect -y 0 > /dev/null 2>&1")
     time.sleep(0.5)
 
 def reset_vl53_addresses():
-    i2c = shared_i2c
     for i, x in enumerate(xshuts):
         x.value = True
         time.sleep(0.1)
         try:
-            sensor = adafruit_vl53l0x.VL53L0X(i2c, address=ADDRESS_BASE + i)
+            sensor = adafruit_vl53l0x.VL53L0X(i2c_vl53, address=ADDRESS_BASE + i)
             sensor.set_address(0x29)
         except:
             pass
@@ -139,11 +198,11 @@ def init_xshuts():
 
 def init_mcp():
     global mcp, relay_pins, mcp_pins
-    mcp = MCP23017(shared_i2c)
+    mcp = MCP23017(i2c_bus0)
 
-    relay_pin_nums = [12, 13, 14, 15]  # B4-B7
-    relay_pins = []
-    mcp_pins = []
+    relay_pin_nums = [12, 13, 14, 15]
+    relay_pins.clear()
+    mcp_pins.clear()
 
     for pin_num in range(16):
         pin = mcp.get_pin(pin_num)
@@ -152,10 +211,10 @@ def init_mcp():
             pin.value = False
             relay_pins.append(pin)
         elif pin_num <= 7:
-            pin.direction = Direction.OUTPUT  # A0–A7
+            pin.direction = Direction.OUTPUT
         else:
-            pin.direction = Direction.INPUT   # B0–B3 ใช้กับ MC-38
-            pin.pull_up = True  # ต่อขาอีกด้านกับ GND
+            pin.direction = Direction.INPUT
+            pin.pull_up = True
         mcp_pins.append(pin)
 
 # ==== SENSOR ====
@@ -175,32 +234,23 @@ def read_sensor(sensor_index):
 # ==== SENSOR SWITCH CHECK ====
 def is_door_closed(channel: int) -> bool:
     try:
-        pin_number = 8 + channel  # ช่อง 0 → B0 (8), ช่อง 1 → B1 (9), ...
-        pin = mcp_pins[pin_number]
-
-        # Software debounce: อ่านหลายครั้งใน 1 วินาที
+        pin = mcp_pins[8 + channel]
         low_count = 0
         for _ in range(15):
             if pin.value == 0:
                 low_count += 1
             time.sleep(0.066)
-
         return low_count >= 12
     except:
         return False
-
-# ==== SERVO CONTROL ====
-def set_servo_angle(channel: int, pulse: int):
-    pca.channels[channel].duty_cycle = pulse * 16  # ต้องคูณ 16
 
 # ==== LED STATUS CHECK ====
 def check_slots_and_update_leds():
     print("🔧 Checking slots and updating LEDs...")
     for i in range(len(vl53_sensors)):
         result = read_sensor(i)
-        green_led = mcp_pins[i]      # A0–A3
-        red_led = mcp_pins[8 + i]    # B0–B3
-
+        green_led = mcp_pins[i]
+        red_led = mcp_pins[8 + i]
         if result == -1:
             print(f"S{i+1}: Sensor error")
             green_led.value = False
@@ -217,7 +267,7 @@ def check_slots_and_update_leds():
 # ==== USER INPUT ====
 def wait_for_user_input():
     global selected_sensor_index, reading_active
-    print("📡 Ready. เลือก Relay (1–4) เพื่อเริ่มอ่าน หรือ 0 เพื่อปิดทั้งหมด:")
+    print("📱 Ready. เลือก Relay (1–4) เพื่อเริ่มอ่าน หรือ 0 เพื่อปิดทั้งหมด:")
     val = input().strip()
     if val in ["0", "1", "2", "3", "4"]:
         n = int(val)
@@ -226,7 +276,7 @@ def wait_for_user_input():
         for i, pin in enumerate(relay_pins):
             pin.value = (i == selected_sensor_index) if reading_active else False
         if reading_active:
-            set_servo_angle(selected_sensor_index, SERVO_OPEN)
+            set_servo_angle(selected_sensor_index, 90)
 
 # ==== ENTRY ====
 if __name__ == "__main__":
